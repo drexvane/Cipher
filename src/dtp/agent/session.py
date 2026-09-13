@@ -473,11 +473,6 @@ def _say_shape(frame: pd.DataFrame, dims: list[str], keys: list[str]) -> str:
 def ask(question: str, wh: Warehouse, model: Model | None = None) -> Answer:
     """One question, no memory - what the CLI's single-shot mode calls."""
     if model is None:
-        from .client import AnthropicModel, OllamaModel, KeywordModel, api_key, is_ollama_available
-        if api_key():
-            model = AnthropicModel()
-        elif is_ollama_available():
-            model = OllamaModel()
-        else:
-            model = KeywordModel(catalog=getattr(wh, "catalog", None))
+        from .client import select_model
+        model = select_model(catalog=getattr(wh, "catalog", None))
     return Session(wh, model).ask(question)

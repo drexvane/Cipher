@@ -32,6 +32,12 @@ from .. import ROOT
 DEFAULT_MODEL = "claude-sonnet-5"
 MODEL_ENV = "DTP_AGENT_MODEL"
 KEY_ENV = "ANTHROPIC_API_KEY"
+PROVIDER_ENV = "DTP_AGENT_PROVIDER"
+NVIDIA_KEY_ENV = "NVIDIA_API_KEY"
+NVIDIA_BASE_URL_ENV = "NVIDIA_BASE_URL"
+NVIDIA_MODEL_ENV = "NVIDIA_MODEL"
+NVIDIA_DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 
 PLAN_TOKENS = 1024      # a tool call, not prose
 SUMMARY_TOKENS = 300    # one sentence, two at most
@@ -98,6 +104,27 @@ def model_id() -> str:
     return os.environ.get(MODEL_ENV) or DEFAULT_MODEL
 
 
+def provider_id() -> str:
+    """Return the explicit provider selector, if an operator set one."""
+    load_dotenv()
+    return os.environ.get(PROVIDER_ENV, "").strip().lower()
+
+
+def nvidia_api_key() -> str | None:
+    load_dotenv()
+    return os.environ.get(NVIDIA_KEY_ENV) or None
+
+
+def nvidia_base_url() -> str:
+    load_dotenv()
+    return (os.environ.get(NVIDIA_BASE_URL_ENV) or NVIDIA_DEFAULT_BASE_URL).rstrip("/")
+
+
+def nvidia_model_id() -> str:
+    load_dotenv()
+    return os.environ.get(NVIDIA_MODEL_ENV) or NVIDIA_DEFAULT_MODEL
+
+
 class AnthropicModel:
     """The real client. Imported lazily so the package works without the SDK."""
 
@@ -139,6 +166,94 @@ class AnthropicModel:
         return Reply(text=text.strip(), tool_call=call)
 
 
+class NvidiaNimModel:
+    """NVIDIA NIM's OpenAI-compatible chat-completions adapter.
+
+    This stays on the stdlib side of the provider seam. Configuration comes only
+    from the local environment or gitignored `.env`; no key enters a request log,
+    return value, report, or frontend response.
+    """
+
+    def __init__(self, model: str | None = None, key: str | None = None,
+                 base_url: str | None = None) -> None:
+        resolved = key or nvidia_api_key()
+        if not resolved:
+            raise RuntimeError(
+                NVIDIA_KEY_ENV + " is not set. Put it in the environment or in a .env "
+                "file (see .env.example); nothing in this repository holds a key."
+            )
+        self.model = model or nvidia_model_id()
+        self.name = "nvidia-" + self.model
+        self._key = resolved
+        self._base_url = (base_url or nvidia_base_url()).rstrip("/")
+
+    @staticmethod
+    def _tool_schema(tool: dict[str, Any]) -> dict[str, Any]:
+        """Map Cipher's function-tool shape to the OpenAI-compatible shape."""
+        return {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {"type": "object"}),
+            },
+        }
+
+    def respond(self, system: str, user: str,
+                tools: Sequence[dict[str, Any]] | None = None,
+                max_tokens: int = PLAN_TOKENS) -> Reply:
+        import json
+        import urllib.error
+        import urllib.request
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+        }
+        if tools:
+            payload["tools"] = [self._tool_schema(tool) for tool in tools]
+            payload["tool_choice"] = "auto"
+
+        try:
+            req = urllib.request.Request(
+                self._base_url + "/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer " + self._key,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+            return Reply(text="")
+
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError):
+            return Reply(text="")
+
+        text = message.get("content") or ""
+        calls = message.get("tool_calls") or []
+        if calls:
+            function = calls[0].get("function", {})
+            name = function.get("name")
+            raw_arguments = function.get("arguments", "{}")
+            try:
+                arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
+            except (TypeError, ValueError):
+                arguments = None
+            if isinstance(name, str) and isinstance(arguments, dict):
+                return Reply(text=str(text).strip(), tool_call=ToolCall(name=name, input=arguments))
+        return Reply(text=str(text).strip())
+
+
 def is_ollama_available(host: str | None = None) -> bool:
     """Check if local Ollama server is running and accessible."""
     import urllib.request
@@ -149,6 +264,40 @@ def is_ollama_available(host: str | None = None) -> bool:
             return resp.status == 200
     except Exception:
         return False
+
+
+def select_model(catalog: Any = None, model: str | None = None) -> Model:
+    """Select one provider once, keeping the established keyless fallback intact.
+
+    NVIDIA is intentionally opt-in: only an explicit `DTP_AGENT_PROVIDER=nvidia`
+    selects it, so a stray key never changes a deployed process's provider.
+    """
+    selected = provider_id()
+    if selected == "nvidia":
+        return NvidiaNimModel(model=model)
+    if selected not in ("", "anthropic", "ollama", "keyword", "stub"):
+        raise RuntimeError(
+            PROVIDER_ENV + " must be one of: nvidia, anthropic, ollama, keyword."
+        )
+    if selected == "anthropic":
+        return AnthropicModel(model=model)
+    if selected == "ollama":
+        if not is_ollama_available():
+            raise RuntimeError("Ollama is not available at OLLAMA_HOST.")
+        return OllamaModel(model=model, catalog=catalog)
+    if selected in ("keyword", "stub"):
+        return KeywordModel(catalog=catalog)
+    if api_key():
+        try:
+            return AnthropicModel(model=model)
+        except RuntimeError:
+            pass
+    if is_ollama_available():
+        try:
+            return OllamaModel(model=model, catalog=catalog)
+        except Exception:
+            pass
+    return KeywordModel(catalog=catalog)
 
 
 class OllamaModel:
@@ -329,15 +478,11 @@ class KeywordModel:
         if not fields.get("metrics") and not patching:
             from .tools import DECLINE_TAG
             suggs = []
-            if self.catalog:
-                from ..dashboard import style
-                if hasattr(style, "get_starter_prompts_from_catalog"):
-                    suggs = style.get_starter_prompts_from_catalog(self.catalog)
-                elif hasattr(self.catalog, "schema") and self.catalog.schema:
-                    m_list = list(self.catalog.schema.measure_columns.keys())
-                    d_list = self.catalog.schema.dimension_columns
-                    if m_list and d_list:
-                        suggs = [f"total {m_list[0]} by {d_list[0]}", f"top 5 {d_list[0]} by {m_list[0]}"]
+            if self.catalog and hasattr(self.catalog, "schema") and self.catalog.schema:
+                m_list = list(self.catalog.schema.measure_columns.keys())
+                d_list = self.catalog.schema.dimension_columns
+                if m_list and d_list:
+                    suggs = [f"total {m_list[0]} by {d_list[0]}", f"top 5 {d_list[0]} by {m_list[0]}"]
             sugg_str = "; ".join(suggs[:3]) if suggs else "total quantity by item name; top 5 item name by quantity"
             return Reply(text=(
                 f"{DECLINE_TAG}: I could not match that to this dataset. Try asking: {sugg_str}."

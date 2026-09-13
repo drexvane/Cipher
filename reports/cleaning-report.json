@@ -1,5 +1,7 @@
 {
-  "generated_at": "2026-09-12T00:47:00",
-  "problems": [],
+  "generated_at": "2026-09-13T00:15:05",
+  "problems": [
+    "cybersecurity_threat_logs.csv: no entry in cleaning_rules.yml, so not cleaned"
+  ],
   "tables": []
 }

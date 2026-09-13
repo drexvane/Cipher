@@ -1,0 +1,26 @@
+{
+  "name": "cipher-ui",
+  "version": "1.0.0",
+  "description": "Standalone frontend for Cipher data analysis platform",
+  "main": "index.html",
+  "scripts": {
+    "start": "npx http-server -p 8080 -o",
+    "dev": "npx http-server -p 8080 -o",
+    "build:css": "npx clean-css-cli -o style.min.css style.css",
+    "build:js": "npx uglifyjs app.js -o app.min.js -c -m",
+    "build": "npm run build:css && npm run build:js"
+  },
+  "keywords": [
+    "data-analysis",
+    "dashboard",
+    "frontend",
+    "cipher"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "clean-css-cli": "^5.6.2",
+    "http-server": "^14.1.1",
+    "uglify-js": "^3.17.4"
+  }
+}

@@ -10,6 +10,7 @@ import io
 import json
 import mimetypes
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,22 @@ CYBER_DATASET_PATH = SAMPLE_DIR / "cybersecurity_threat_logs.csv"
 SAMPLE_DATASET_PATH = CYBER_DATASET_PATH if CYBER_DATASET_PATH.exists() else (SAMPLE_DIR / "ecommerce_orders.csv")
 CONFIG_DIR = REPO_ROOT / "config"
 DOCS_DIR = REPO_ROOT / "docs"
+UPLOAD_DIR = RAW_DIR
+_WORKSPACE_IGNORED_DIRECTORIES = {".git", ".claude", ".venv", "venv", "node_modules", "__pycache__"}
+_WORKSPACE_IGNORED_FILES = {".env", ".env.local", ".env.production", ".env.development"}
+
+
+def _safe_upload_name(filename: str | None, fallback: str = "uploaded_dataset") -> str:
+    """Keep uploads in the workspace without allowing a client path to escape it."""
+    return Path(filename or fallback).name or fallback
+
+
+def _save_upload(filename: str | None, content: bytes) -> tuple[str, Path]:
+    """Persist an uploaded source so the Workspace explorer can accurately display it."""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    target = UPLOAD_DIR / _safe_upload_name(filename)
+    target.write_bytes(content)
+    return target.relative_to(REPO_ROOT).as_posix(), target
 
 app = FastAPI(
     title="Cipher IDE Control Room Engine",
@@ -75,6 +92,7 @@ class ServerState:
     candidate_joins: list[dict[str, Any]] = []
     latest_answer: Any = None
     latest_pipeline: dict[str, Any] | None = None
+    session_turns: list[dict[str, str]] = []
 
 
 state = ServerState()
@@ -82,17 +100,34 @@ state = ServerState()
 
 def _get_model(wh: warehouse.Warehouse | None = None):
     cat = getattr(wh, "catalog", None) if wh else None
-    if client.api_key():
+    return client.select_model(catalog=cat)
+
+
+def session_title(question: str, model: Any = None) -> str:
+    """Generate an intelligent, concise session title using the LLM if active, or clean fallback."""
+    q_clean = question.strip()
+    if not q_clean:
+        return "New Session"
+
+    # If an LLM model is active and not keyword stub, ask it to name the session
+    if model and getattr(model, "name", "") not in ("keyword-stub", "scripted", ""):
         try:
-            return client.AnthropicModel()
-        except RuntimeError:
-            pass
-    if client.is_ollama_available():
-        try:
-            return client.OllamaModel(catalog=cat)
+            prompt = f"Provide a concise 3 to 5 word topic title for this analytics query: \"{q_clean}\". Output ONLY the title, with no quotes or punctuation at the end."
+            reply = model.respond(system="You create concise 3 to 5 word titles for data queries.", user=prompt, max_tokens=25)
+            text = (reply.text or "").strip().strip('"\'')
+            if text and len(text) <= 50 and not text.lower().startswith("here"):
+                return text[:1].upper() + text[1:]
         except Exception:
             pass
-    return client.KeywordModel(catalog=cat)
+
+    title = " ".join(q_clean.rstrip("?!.").split())
+    for prefix in ("can you show me ", "could you show me ", "can you ", "could you ", "please show me ", "please ", "show me ", "tell me ", "what is ", "what are ", "how many "):
+        if title.lower().startswith(prefix):
+            title = title[len(prefix):]
+            break
+    if len(title) > 48:
+        title = title[:48].rsplit(" ", 1)[0].rstrip() + "…"
+    return title[:1].upper() + title[1:]
 
 
 def load_cached_pipeline_report() -> dict[str, Any]:
@@ -553,10 +588,6 @@ def get_status() -> dict[str, Any]:
     starter_prompts = style.get_starter_prompts(wh) if wh else []
     if "cyber" in state.active_table_name or "threat" in state.active_table_name:
         starter_prompts = [
-            "Show the trend of failed login attempts by department over the last 7 days",
-            "Total failed logins by department",
-            "Total risk score by threat category",
-            "Total bytes transferred by threat category",
             "Total failed logins by user id",
             "Count of events by threat category",
             "Average risk score by department",
@@ -583,94 +614,71 @@ def get_status() -> dict[str, Any]:
     }
 
 
+@app.get("/api/sessions")
+def get_sessions() -> dict[str, Any]:
+    """Return the current process's agent activity as a compact session list."""
+    initialize_default_dataset()
+    return {"sessions": state.session_turns}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session_endpoint(session_id: str) -> dict[str, Any]:
+    """Delete a single session turn by ID."""
+    state.session_turns = [s for s in state.session_turns if str(s.get("id")) != str(session_id)]
+    return {"ok": True, "remaining": len(state.session_turns)}
+
+
 @app.get("/api/workspace/tree")
 def get_workspace_tree() -> dict[str, Any]:
     """Scan the workspace directory and return structured file nodes with status glyphs."""
     initialize_default_dataset()
 
-    def scan_dir(target_dir: Path, status_kind: str = "neutral", label: str = "") -> list[dict[str, Any]]:
-        nodes = []
+    def scan_dir(target_dir: Path, status_kind: str = "neutral") -> list[dict[str, Any]]:
         if not target_dir.exists():
-            return nodes
-        for p in sorted(target_dir.iterdir()):
-            if p.name.startswith(".") or p.name == "__pycache__":
-                continue
-            rel = p.relative_to(REPO_ROOT).as_posix()
-            if p.is_dir():
+            return []
+
+        entries = [
+            path for path in target_dir.iterdir()
+            if path.name not in _WORKSPACE_IGNORED_DIRECTORIES
+            and path.name not in _WORKSPACE_IGNORED_FILES
+        ]
+        entries.sort(key=lambda path: (not path.is_dir(), path.name.casefold()))
+        nodes = []
+        for path in entries:
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            if path.is_dir():
                 nodes.append({
-                    "name": p.name,
+                    "name": path.name,
                     "path": rel,
                     "type": "directory",
                     "status": status_kind,
-                    "children": scan_dir(p, status_kind),
+                    "children": scan_dir(path, status_kind),
                 })
-            else:
-                stat = p.stat()
-                # Status rules: teal for published/clean/validated, amber for raw/sample uncommitted, neutral for configs
-                file_status = status_kind
-                if rel == state.active_file_path:
-                    file_status = "teal" if state.validation_status == "passed" else "amber"
-                nodes.append({
-                    "name": p.name,
-                    "path": rel,
-                    "type": "file",
-                    "extension": p.suffix.lower(),
-                    "size": stat.st_size,
-                    "size_formatted": format_size(stat.st_size),
-                    "status": file_status,
-                    "is_active": rel == state.active_file_path,
-                })
+                continue
+
+            stat = path.stat()
+            file_status = "teal" if rel == state.active_file_path and state.validation_status == "passed" else status_kind
+            nodes.append({
+                "name": path.name,
+                "path": rel,
+                "type": "file",
+                "extension": path.suffix.lower(),
+                "size": stat.st_size,
+                "size_formatted": format_size(stat.st_size),
+                "status": file_status,
+                "is_active": rel == state.active_file_path,
+            })
         return nodes
 
     tree = [
         {
-            "name": "data/sample_datasets",
-            "path": "data/sample_datasets",
-            "type": "directory",
-            "status": "teal",
-            "badge": "sample datasets",
-            "children": scan_dir(SAMPLE_DIR, status_kind="teal"),
-        },
-        {
-            "name": "data/raw",
-            "path": "data/raw",
-            "type": "directory",
-            "status": "amber",
-            "badge": "source input",
-            "children": scan_dir(RAW_DIR, status_kind="amber"),
-        },
-        {
-            "name": "data/clean",
-            "path": "data/clean",
-            "type": "directory",
-            "status": "teal",
-            "badge": "parquet clean",
-            "children": scan_dir(CLEAN_DIR, status_kind="teal"),
-        },
-        {
-            "name": "data/versions",
-            "path": "data/versions",
-            "type": "directory",
-            "status": "teal",
-            "badge": "snapshots",
-            "children": scan_dir(VERSIONS_DIR, status_kind="teal"),
-        },
-        {
-            "name": "reports",
-            "path": "reports",
+            "name": "Cipher",
+            "path": ".",
             "type": "directory",
             "status": "neutral",
-            "badge": "audit & alerts",
-            "children": scan_dir(REPORTS_DIR, status_kind="neutral"),
-        },
-        {
-            "name": "config",
-            "path": "config",
-            "type": "directory",
-            "status": "neutral",
-            "badge": "rules & policy",
-            "children": scan_dir(CONFIG_DIR, status_kind="neutral"),
-        },
+            "badge": "project root",
+            "children": scan_dir(REPO_ROOT),
+        }
     ]
 
     return {
@@ -975,12 +983,13 @@ async def upload_files(files: list[UploadFile] = File(...)) -> dict[str, Any]:
         if len(files) == 1:
             file = files[0]
             content = await file.read()
-            res = ingest.ingest_tabular(content, file.filename or "uploaded_dataset")
+            upload_path, saved_file = _save_upload(file.filename, content)
+            res = ingest.ingest_tabular(content, saved_file.name)
 
             state.warehouse = res.warehouse
-            state.active_dataset_name = file.filename or "Uploaded Dataset"
+            state.active_dataset_name = saved_file.name
             state.active_table_name = res.table_name
-            state.active_file_path = f"data/raw/{file.filename or 'uploaded.csv'}"
+            state.active_file_path = upload_path
             state.active_snapshot_id = "in-memory-uploaded"
             state.validation_status = "passed" if res.profile.quality_score >= 90 else "warning"
             state.row_count = res.profile.n_rows
@@ -1015,9 +1024,12 @@ async def upload_files(files: list[UploadFile] = File(...)) -> dict[str, Any]:
             }
         else:
             sources = []
+            uploaded_paths = []
             for f in files:
                 bytes_data = await f.read()
-                sources.append((bytes_data, f.filename or "dataset"))
+                upload_path, saved_file = _save_upload(f.filename, bytes_data)
+                uploaded_paths.append(upload_path)
+                sources.append((bytes_data, saved_file.name))
 
             multi_res = ingest.ingest_multiple_tabular(sources)
             wh = multi_res.warehouse
@@ -1027,7 +1039,7 @@ async def upload_files(files: list[UploadFile] = File(...)) -> dict[str, Any]:
             state.warehouse = wh
             state.active_dataset_name = f"Multi-Dataset ({len(files)} tables)"
             state.active_table_name = primary_tbl
-            state.active_file_path = f"data/raw/{files[0].filename}"
+            state.active_file_path = uploaded_paths[0]
             state.active_snapshot_id = "in-memory-multi"
             state.validation_status = "passed"
             state.row_count = sum(r.profile.n_rows for r in multi_res.results.values())
@@ -1082,15 +1094,29 @@ def ask_question(payload: AskRequest) -> dict[str, Any]:
 
     answer = state.session.ask(q)
     state.latest_answer = answer
+    session_title_str = session_title(q, state.session.model if state.session else None)
 
     if not answer.ok:
         refusal_msg = answer.refusal.message if getattr(answer, "refusal", None) else "Query could not be answered."
         suggs = list(answer.refusal.suggestions) if getattr(answer, "refusal", None) and answer.refusal.suggestions else []
         if not suggs and state.warehouse:
             suggs = style.get_starter_prompts(state.warehouse)
+        session_turn = {
+            "id": str(len(state.session_turns) + 1),
+            "subject": session_title_str,
+            "question": q,
+            "time": datetime.now(timezone.utc).isoformat(),
+            "summary": refusal_msg,
+            "caption": "",
+            "model": getattr(answer, "model", "DuckDB Engine"),
+            "status": "needs-input",
+            "result": None,
+        }
+        state.session_turns.append(session_turn)
         return {
             "ok": False,
             "question": q,
+            "subject": session_title_str,
             "refusal": refusal_msg,
             "suggestions": suggs[:4],
         }
@@ -1193,9 +1219,10 @@ def ask_question(payload: AskRequest) -> dict[str, Any]:
     window_str = str(plan_dict.get("window") or "full")
     plan_summary = f"metrics: {metrics_str} | by: {by_str} | window: {window_str}"
 
-    return {
+    result_payload = {
         "ok": True,
         "question": q,
+        "subject": session_title_str,
         "summary": answer.summary,
         "caption": answer.caption,
         "tiles": tiles,
@@ -1217,6 +1244,21 @@ def ask_question(payload: AskRequest) -> dict[str, Any]:
         "follow_ups": follow_ups,
     }
 
+    session_turn = {
+        "id": str(len(state.session_turns) + 1),
+        "subject": session_title_str,
+        "question": q,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "summary": answer.summary or (answer.refusal.message if answer.refusal else "Query completed."),
+        "caption": answer.caption,
+        "model": getattr(answer, "model", "DuckDB Engine"),
+        "status": "ready" if answer.ok else "needs-input",
+        "result": result_payload,
+    }
+    state.session_turns.append(session_turn)
+
+    return result_payload
+
 
 @app.post("/api/reset")
 def reset_session() -> dict[str, bool]:
@@ -1224,6 +1266,7 @@ def reset_session() -> dict[str, bool]:
         state.session.reset()
         state.session.log.clear()
         state.latest_answer = None
+    state.session_turns.clear()
     return {"ok": True}
 
 

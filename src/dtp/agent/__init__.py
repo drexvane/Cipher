@@ -26,15 +26,16 @@ and declines anything it does not recognise, which is what `dtp ask --stub` runs
 """
 
 from dtp.agent import client, guard, plan, session, tools
-from dtp.agent.client import (AnthropicModel, KeywordModel, Model, Reply,
-                              ScriptedModel, ToolCall)
+from dtp.agent.client import (AnthropicModel, KeywordModel, Model, NvidiaNimModel,
+                              Reply, ScriptedModel, ToolCall, select_model)
 from dtp.agent.guard import REFUSALS, PlanError, Refusal, verify_summary
 from dtp.agent.plan import Plan, execute, validate
 from dtp.agent.session import Answer, Session, Tile, ask
 
 __all__ = [
     "client", "guard", "plan", "session", "tools",
-    "AnthropicModel", "KeywordModel", "Model", "Reply", "ScriptedModel", "ToolCall",
+    "AnthropicModel", "KeywordModel", "Model", "NvidiaNimModel", "Reply",
+    "ScriptedModel", "ToolCall", "select_model",
     "REFUSALS", "PlanError", "Refusal", "verify_summary",
     "Plan", "execute", "validate",
     "Answer", "Session", "Tile", "ask",

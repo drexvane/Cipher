@@ -230,12 +230,11 @@ def _model():
     """
     from dtp.agent import client as agent_client
 
-    if agent_client.api_key():
-        try:
-            return agent_client.AnthropicModel()
-        except RuntimeError as exc:                  # the SDK is not installed
-            st.warning(str(exc))
-    return agent_client.KeywordModel()
+    try:
+        return agent_client.select_model()
+    except RuntimeError as exc:
+        st.warning(str(exc))
+        return agent_client.KeywordModel()
 
 
 def _session(wh, version_id: str):

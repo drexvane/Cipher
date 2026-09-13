@@ -280,17 +280,15 @@ def cmd_ask(args: argparse.Namespace) -> int:
     from .agent import client as agent_client
     from .warehouse import open_warehouse
 
-    if args.stub:
-        model = agent_client.KeywordModel()
-    elif agent_client.api_key():
-        model = agent_client.AnthropicModel(model=args.model)
-    else:
-        print("no " + agent_client.KEY_ENV + " found, so this is the keyless stub:")
-        print("it matches registry keys against your words and declines the rest.")
-        print("Copy .env.example to .env for the real thing.\n")
-        model = agent_client.KeywordModel()
-
     with open_warehouse(version_id=args.snapshot, versions_dir=args.versions) as wh:
+        if args.stub:
+            model = agent_client.KeywordModel(catalog=getattr(wh, "catalog", None))
+        else:
+            model = agent_client.select_model(catalog=getattr(wh, "catalog", None), model=args.model)
+            if isinstance(model, agent_client.KeywordModel):
+                print("no live provider configured, so this is the keyless stub:")
+                print("it matches registry keys against your words and declines the rest.")
+                print("Copy .env.example to .env for a configured provider.\n")
         session = Session(wh, model)
         print("snapshot " + wh.version_id + "   model " + model.name)
         question = " ".join(args.question).strip()
